@@ -2,7 +2,7 @@
 
 ## Video
 
-Controlling the AC from Home Assistant: mode, setpoint, fan speed (click to play).
+Controlling the AC from Home Assistant: mode, setpoint, fan speed (demo.mp4).
 
 [<img src="demo-poster.jpg" alt="Demo video" width="300">](demo.mp4)
 
