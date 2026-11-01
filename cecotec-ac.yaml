@@ -1,0 +1,475 @@
+# Cecotec monoblock AC: state from CN1 sniffing, control by IR key injection.
+# Full wiring: wiring.md
+
+esphome:
+  name: cecotec-ac
+  includes:
+    - cecotec/cn1_decode.h
+    - cecotec/melodies.h
+  on_boot:
+    priority: -100
+    then:
+      - lambda: |-
+          cn1_unknown_load();
+          id(ac).add_on_failed_callback([]() { id(play_error).execute("AC command failed"); });
+      - script.execute:
+          id: report_unknown
+          msg: ""
+      - if:
+          condition:
+            switch.is_on: beeper
+          then:
+            - rtttl.play:
+                rtttl: !lambda "return melody(MELODY_STARTUP, id(melody_pitch).state);"
+
+external_components:
+  - source:
+      type: local
+      path: cecotec/components
+
+esp8266:
+  board: d1_mini
+  restore_from_flash: true # keep the unknown-value store across power loss
+
+script:
+  - id: report_unknown
+    parameters:
+      msg: string
+    then:
+      - lambda: |-
+          if (!msg.empty()) {
+            id(unknown_last).publish_state(msg);
+            if (id(beeper).state)
+              id(buzzer).play(melody(MELODY_UNKNOWN, id(melody_pitch).state));
+          }
+          id(unknown_list).publish_state(cn1_unknown_summary(cn1_unknown_store));
+          id(unknown_count).publish_state(cn1_unknown_store.n);
+
+  # Error melody: HA command failed, WiFi/CN1 link lost, sensor read failed. Max once a minute.
+  # Silent for the first 60 s after boot; a lasting WiFi/link problem is reported by the 15 s check after that.
+  - id: play_error
+    parameters:
+      reason: string
+    then:
+      - lambda: |-
+          static uint32_t last = 0;
+          if (millis() < 60000) {
+            ESP_LOGD("error", "%s (ignored during boot)", reason.c_str());
+            return;
+          }
+          if (last != 0 && millis() - last < 60000)
+            return;
+          last = millis();
+          ESP_LOGW("error", "Error melody: %s", reason.c_str());
+          if (id(beeper).state)
+            id(buzzer).play(melody(MELODY_ERROR, id(melody_pitch).state));
+
+interval:
+  - interval: 1s
+    then:
+      - lambda: |-
+          float h = id(ac).timer_hours();
+          float old = id(timer_hours).state;
+          if (h != old && !(std::isnan(h) && std::isnan(old)))
+            id(timer_hours).publish_state(h);
+
+  # Error melody once per outage: WiFi down (also never connected after boot), main board frames missing.
+  - interval: 15s
+    then:
+      - lambda: |-
+          static bool wifi_alerted = false;
+          static bool link_alerted = false;
+          bool wifi_ok = wifi::global_wifi_component->is_connected();
+          bool link_ok = id(ac).link_ok();
+          if (millis() < 60000)
+            return; // boot grace: don't mark anything as alerted yet
+          if (!wifi_ok && !wifi_alerted)
+            id(play_error).execute("WiFi not connected");
+          else if (!link_ok && !link_alerted)
+            id(play_error).execute("no frames from AC main board");
+          wifi_alerted = !wifi_ok;
+          link_alerted = !link_ok;
+
+logger:
+  baud_rate: 0 # free hardware UART RX for sniffing; view logs over WiFi
+  level: DEBUG
+
+api:
+  encryption:
+    key: "YOUR_API_ENCRYPTION_KEY"
+
+ota:
+  - platform: esphome
+    id: ota_esphome
+    password: "YOUR_OTA_PASSWORD"
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+  ap: {}
+  # Chime on every connect, after the startup melody has finished.
+  on_connect:
+    - if:
+        condition:
+          switch.is_on: beeper
+        then:
+          - delay: 500ms
+          - wait_until:
+              condition:
+                lambda: "return !id(buzzer).is_playing();"
+              timeout: 15s
+          - rtttl.play:
+              rtttl: !lambda "return melody(MELODY_WIFI, id(melody_pitch).state);"
+
+captive_portal:
+
+# CN1 is a pulse-distance protocol, not UART (cn1_decode.h). Each line logs under its own tag.
+remote_receiver:
+  - id: ir_rx
+    pin:
+      number: GPIO12
+      inverted: true
+      mode:
+        input: true
+        pullup: true
+    dump: all
+    idle: 10ms
+    buffer_size: 2kb
+    on_nec:
+      then:
+        - lambda: |-
+            if (x.address != 0x7F80)
+              return;
+            std::string msg = cn1_check_nec(cn1_unknown_store, x.command);
+            if (!msg.empty())
+              id(report_unknown).execute(msg);
+
+  - id: cn1_disp_to_main # CN1 TX via divider
+    pin:
+      number: GPIO4
+      inverted: true
+    idle: 10ms
+    buffer_size: 2kb
+    on_raw:
+      then:
+        - lambda: |-
+            static Cn1Last last{};
+            size_t len = cn1_log_frame("disp>main", x, last);
+            if (len == 0 || !last.fresh)
+              return;
+            if (len == 3)
+              id(ac).on_disp_key(last.data[1]);
+            std::string msg = cn1_check_unknown(cn1_unknown_store, CN1_DIR_DISP, last.data, len);
+            if (!msg.empty())
+              id(report_unknown).execute(msg);
+
+  - id: cn1_main_to_disp # CN1 RX via divider
+    pin:
+      number: GPIO14
+      inverted: true
+    idle: 10ms
+    buffer_size: 2kb
+    on_raw:
+      then:
+        - lambda: |-
+            static Cn1Last last{};
+            size_t len = cn1_log_frame("main>disp", x, last);
+            if (len == 0)
+              return;
+            id(ac).on_main_frame(last.data, len); // repeats too: keeps the state fresh
+            if (!last.fresh)
+              return;
+            std::string msg = cn1_check_unknown(cn1_unknown_store, CN1_DIR_MAIN, last.data, len);
+            if (!msg.empty())
+              id(report_unknown).execute(msg);
+            if (len != 9)
+              return;
+            // Byte 7 != 00: main board asks for a beep. HA commands stay silent,
+            // and a new unknown value already plays its own melody.
+            if (last.data[7] != 0x00 && msg.empty() && id(beeper).state && !id(ac).own_change())
+              id(buzzer).play(melody(MELODY_BEEP, id(melody_pitch).state));
+            std::string text = cn1_seg_text(last.data[1]) + cn1_seg_text(last.data[2]);
+            if (id(display_text).state != text)
+              id(display_text).publish_state(text);
+
+# IR injection: GPIO13 -> NPN pulls CN3 IR line low (= IR mark).
+# Receiver output is already demodulated, so no carrier (100% duty).
+remote_transmitter:
+  id: ir_tx
+  pin: GPIO13
+  carrier_duty_percent: 100%
+
+climate:
+  - platform: cecotec_ac
+    id: ac
+    name: "AC"
+    transmitter_id: ir_tx
+    sensor: room_temp
+    humidity_sensor: room_hum
+
+switch:
+  - platform: template
+    id: beeper
+    name: "Beeper"
+    icon: mdi:volume-high
+    entity_category: config
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_ON
+
+# Buzzer: GPIO15 -> NPN low-side driver -> BUZ1 piezo on 5V.
+# PWM off = pin LOW, required for boot (GPIO15 strap).
+output:
+  - platform: esp8266_pwm
+    id: buzzer_out
+    pin: GPIO15
+    frequency: 2700Hz
+
+rtttl:
+  id: buzzer
+  output: buzzer_out
+  gain: 50% # used as PWM duty directly; 50% = loudest square wave, 100% = DC (clicks only). Set by "Beeper volume"
+
+# Melody test: index into MELODIES in melodies.h; keep the select options in sync (alphabetical).
+globals:
+  - id: melody_idx
+    type: int
+    initial_value: "MELODY_BEEP" # matches initial_option
+
+select:
+  - platform: template
+    id: melody_select
+    name: "Test melody"
+    entity_category: config
+    optimistic: true
+    options:
+      - "All Star"
+      - "Beep"
+      - "Die Forelle"
+      - "Die Forelle - extended"
+      - "Double beep"
+      - "Error"
+      - "FF victory"
+      - "FF victory - extended"
+      - "Fur Elise"
+      - "Golden Wind"
+      - "Golden Wind - extended"
+      - "Happy Birthday"
+      - "Imperial March"
+      - "Mario 1-up"
+      - "Mario coin"
+      - "Mario intro"
+      - "Mario theme - extended"
+      - "Megalovania"
+      - "Megalovania - extended"
+      - "Nokia ringtone"
+      - "Stardust Crusaders"
+      - "Stardust Crusaders - extended"
+      - "Startup"
+      - "Tetris"
+      - "Toccata and Fugue"
+      - "Toccata and Fugue - extended"
+      - "Unknown value"
+      - "WiFi connected"
+      - "Zelda secret"
+    initial_option: "Beep"
+    on_value:
+      - globals.set:
+          id: melody_idx
+          value: !lambda "return i;"
+
+number:
+  - platform: template
+    id: tone_freq
+    name: "Test tone frequency"
+    entity_category: config
+    optimistic: true
+    min_value: 500
+    max_value: 5000
+    step: 100
+    initial_value: 2700
+    unit_of_measurement: Hz
+
+  # Piezo loudness via PWM duty: tone amplitude ~ sin(pi * duty), max at 50%.
+  # Slider squared first so the low half of the range is usable.
+  - platform: template
+    id: beeper_volume
+    name: "Beeper volume"
+    icon: mdi:volume-medium
+    entity_category: config
+    optimistic: true
+    restore_value: true
+    min_value: 5
+    max_value: 100
+    step: 5
+    initial_value: 60
+    unit_of_measurement: "%"
+    on_value:
+      - lambda: |-
+          float v = x / 100.0f;
+          id(buzzer).set_gain(asinf(v * v) / M_PI);
+
+  # Pitch shift for all melodies (transpose() in melodies.h). Notes beyond rtttl's C4..B7
+  # fold back by octaves, so ±47 covers every distinct shift. Piezo is loudest around E7/F7.
+  - platform: template
+    id: melody_pitch
+    name: "Melody pitch"
+    icon: mdi:music-note
+    entity_category: config
+    optimistic: true
+    restore_value: true
+    min_value: -47
+    max_value: 47
+    step: 1
+    initial_value: 0
+    unit_of_measurement: st
+
+  # AC timer. Shows the hours last seen on the display (the frames carry no countdown).
+  # Setting it presses timer/up/down; 0 cancels.
+  - platform: template
+    id: timer_hours
+    name: "Timer hours"
+    icon: mdi:timer-outline
+    min_value: 0
+    max_value: 24
+    step: 1
+    mode: box
+    unit_of_measurement: h
+    update_interval: never # published on change by the 1s interval
+    set_action:
+      - lambda: id(ac).set_timer((int) x);
+
+  # Dry mode: on above target + this, off below target - this.
+  - platform: template
+    id: humidity_hysteresis
+    name: "Dry hysteresis"
+    entity_category: config
+    optimistic: true
+    restore_value: true
+    min_value: 1
+    max_value: 10
+    step: 0.5
+    initial_value: 3
+    unit_of_measurement: "%"
+    on_value:
+      - lambda: id(ac).set_humidity_hysteresis(x);
+
+sensor:
+  - platform: dht
+    model: DHT22 # sold as DHT11, but sends DHT22/AM2302 data format (16-bit, 0.1 steps)
+    pin: GPIO5
+    update_interval: 30s
+    temperature:
+      id: room_temp
+      name: "Room temperature"
+      on_value:
+        - if:
+            condition:
+              lambda: return isnan(x); # DHT read failed
+            then:
+              - script.execute:
+                  id: play_error
+                  reason: "DHT read failed"
+    humidity:
+      id: room_hum
+      name: "Room humidity"
+
+  - platform: template
+    id: unknown_count
+    name: "Unknown values count"
+    accuracy_decimals: 0
+    entity_category: diagnostic
+    update_interval: never
+
+button:
+  - platform: template
+    name: "Play melody"
+    entity_category: config
+    on_press:
+      - rtttl.play:
+          rtttl: !lambda "return melody(id(melody_idx), id(melody_pitch).state);"
+
+  - platform: template
+    name: "Stop melody"
+    entity_category: config
+    on_press:
+      - rtttl.stop
+
+  - platform: template
+    name: "Play test tone"
+    entity_category: config
+    on_press:
+      - rtttl.stop
+      - output.esp8266_pwm.set_frequency:
+          id: buzzer_out
+          frequency: !lambda "return id(tone_freq).state;"
+      - output.set_level:
+          id: buzzer_out
+          level: !lambda "return id(buzzer).get_gain();"
+      - delay: 500ms
+      - output.turn_off: buzzer_out
+
+  - platform: template
+    name: "Timer +1h"
+    icon: mdi:timer-plus-outline
+    on_press:
+      - lambda: id(ac).adjust_timer(1);
+
+  - platform: template
+    name: "Timer -1h"
+    icon: mdi:timer-minus-outline
+    on_press:
+      - lambda: id(ac).adjust_timer(-1);
+
+  - platform: template
+    name: "Timer off"
+    icon: mdi:timer-off-outline
+    on_press:
+      - lambda: id(ac).set_timer(0);
+
+  - platform: template
+    name: "Power (IR test)"
+    on_press:
+      - remote_transmitter.transmit_nec:
+          address: 0x7F80
+          command: 0x639C
+
+  - platform: template
+    name: "Clear unknown values"
+    entity_category: config
+    on_press:
+      - lambda: |-
+          cn1_unknown_clear();
+          id(unknown_last).publish_state("none");
+      - script.execute:
+          id: report_unknown
+          msg: ""
+
+binary_sensor:
+  - platform: template
+    name: "Timer"
+    icon: mdi:timer-outline
+    lambda: return id(ac).timer_on();
+
+  - platform: template
+    name: "AC link"
+    device_class: connectivity
+    entity_category: diagnostic
+    lambda: return id(ac).link_ok();
+
+text_sensor:
+  - platform: template
+    id: display_text
+    name: "Display"
+    update_interval: never
+
+  - platform: template
+    id: unknown_last
+    name: "Unknown value (last)"
+    entity_category: diagnostic
+    update_interval: never
+
+  - platform: template
+    id: unknown_list
+    name: "Unknown values"
+    entity_category: diagnostic
+    update_interval: never

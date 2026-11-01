@@ -1,0 +1,5 @@
+/.esphome/
+/secrets.yaml
+/cecotec-ac-local.yaml
+__pycache__/
+tools/midi/
