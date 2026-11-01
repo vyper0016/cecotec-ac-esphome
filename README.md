@@ -28,7 +28,7 @@ Local Home Assistant control for a [Cecotec portable air conditioner](https://ww
 
 ## Wiring
 
-![Full schematic](diagrams/00_full.png)
+![Full schematic](diagrams/00_full.jpg)
 
 Details and per-circuit notes: [wiring.md](wiring.md).
 
